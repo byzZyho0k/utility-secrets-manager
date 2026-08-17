@@ -9,7 +9,7 @@ as a command-line argument — so it cannot end up in terminal scrollback, an ag
 transcript, a log file, or `ps` output.
 
 ```bash
-oh-cred run edge1 myorg admin -- hzn exchange node list -o myorg
+oh-cred run hub-a myorg admin -- hzn exchange node list -o myorg
 ```
 
 ## The one-paragraph version

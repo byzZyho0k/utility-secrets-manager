@@ -10,7 +10,7 @@ operations. The tool exists because these are not hypothetical.
 ## 1. A credential that doesn't know which system it belongs to
 
 **The failure.** Six credential files sat in a directory, named by org and user:
-`root-root.env`, `myorg-admin.env`, `ibm-admin.env`, and so on. Copies of the
+`root-root.env`, `myorg-admin.env`, `acme-admin.env`, and so on. Copies of the
 same six files also sat on a second host. Nothing in any file recorded *which
 exchange* the credential authenticated against.
 
