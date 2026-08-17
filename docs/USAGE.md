@@ -15,21 +15,21 @@ oh-cred verify-all                             # test every stored credential
 `HZN_EXCHANGE_USER_AUTH`, `HZN_EXCHANGE_URL`, and `HZN_FSS_CSSURL` set:
 
 ```bash
-oh-cred run edge1 myorg admin -- hzn exchange node list -o myorg
-oh-cred run edge1 root  root  -- hzn exchange org list
-oh-cred run academy myorg admin -- hzn mms status
+oh-cred run hub-a myorg admin -- hzn exchange node list -o myorg
+oh-cred run hub-a root  root  -- hzn exchange org list
+oh-cred run hub-b myorg admin -- hzn mms status
 ```
 
 Wrap a whole script rather than exporting variables into your shell:
 
 ```bash
-oh-cred run edge1 myorg admin -- ./hzn-css-sync.sh 2.32.0-1803
+oh-cred run hub-a myorg admin -- ./hzn-css-sync.sh 2.32.0-1803
 ```
 
 Need several commands? Wrap a shell, so the secret still dies with one process:
 
 ```bash
-oh-cred run edge1 myorg admin -- bash -c '
+oh-cred run hub-a myorg admin -- bash -c '
   hzn exchange node list -o myorg
   hzn exchange service list -o myorg
 '
@@ -42,7 +42,7 @@ the command and org-qualify the username **by expansion**, so the password is
 never retyped:
 
 ```bash
-oh-cred run edge1 root root -- bash -c '
+oh-cred run hub-a root root -- bash -c '
   export HZN_ORG_ID=myorg
   export HZN_EXCHANGE_USER_AUTH="root/$HZN_EXCHANGE_USER_AUTH"
   hzn exchange node list -o myorg'
@@ -55,11 +55,11 @@ qualification entirely.
 
 ```bash
 $ oh-cred verify-all
-  academy    myorg/admin          org-admin  OK (HTTP 200)
-  edge1      IBM/admin            org-admin  OK (HTTP 200)
-  edge1      myorg/admin          org-admin  OK (HTTP 200)
-  edge1      root/root            superuser  OK (HTTP 200)
-  unh        examples/joewxboy    org-user   OK (HTTP 200)
+  hub-a      acme/admin           org-admin  OK (HTTP 200)
+  hub-a      myorg/admin          org-admin  OK (HTTP 200)
+  hub-a      root/root            superuser  OK (HTTP 200)
+  hub-b      myorg/admin          org-admin  OK (HTTP 200)
+  hub-c      examples/alice       org-user   OK (HTTP 200)
 ```
 
 | Result | Meaning | Action |
