@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# oh-cred — fetch an Open Horizon credential from Bao and inject it into a
+# command's environment. The secret is never printed, never written to disk and
+# never passed as an argument, so it cannot leak into scrollback, a transcript
+# or `ps` output. There is deliberately no "show me the password" mode: if you
+# genuinely need the value, log in to Bao yourself with an admin policy.
+#
+# Usage:
+#   oh-cred list                                  hubs and credentials (no secrets)
+#   oh-cred run <hub> <org> <user> -- <cmd...>    run cmd with HZN_* exported
+#   oh-cred verify <hub> <org> <user>             test the credential against its own hub
+#   oh-cred verify-all                            verify every stored credential
+#
+# Auth: uses $BAO_TOKEN when set (a human login), otherwise the per-hub
+# read-only AppRole in /etc/openbao/approle/llm-<hub>-ro.env.
+set -uo pipefail
+
+export BAO_ADDR="${BAO_ADDR:-https://127.0.0.1:8200}"
+export BAO_CACERT="${BAO_CACERT:-/opt/openbao/tls/tls.crt}"
+APPROLE_DIR=/etc/openbao/approle
+
+die() { echo "oh-cred: $*" >&2; exit 1; }
+command -v bao >/dev/null || die "bao not installed"
+
+# Emit a token for the given hub, without echoing the secret_id.
+_token_for() {  # _token_for <hub>
+  if [ -n "${BAO_TOKEN:-}" ]; then printf '%s' "$BAO_TOKEN"; return 0; fi
+  local f="$APPROLE_DIR/llm-$1-ro.env"
+  [ -r "$f" ] || die "no BAO_TOKEN set and cannot read $f (is this hub configured?)"
+  local rid sid
+  rid=$(grep -m1 '^ROLE_ID=' "$f" | cut -d= -f2-)
+  sid=$(grep -m1 '^SECRET_ID=' "$f" | cut -d= -f2-)
+  bao write -field=token auth/approle/login role_id="$rid" secret_id="$sid" 2>/dev/null \
+    || die "AppRole login failed for hub '$1'"
+}
+
+_token_all() {
+  if [ -n "${BAO_TOKEN:-}" ]; then printf '%s' "$BAO_TOKEN"; return 0; fi
+  local f="$APPROLE_DIR/fleet-verifier.env" rid sid
+  [ -r "$f" ] || die "no BAO_TOKEN and cannot read $f"
+  rid=$(grep -m1 '^ROLE_ID=' "$f" | cut -d= -f2-)
+  sid=$(grep -m1 '^SECRET_ID=' "$f" | cut -d= -f2-)
+  bao write -field=token auth/approle/login role_id="$rid" secret_id="$sid" 2>/dev/null \
+    || die "fleet-verifier AppRole login failed"
+}
+
+_hub_field() {  # _hub_field <token> <hub> <field>
+  BAO_TOKEN="$1" bao kv get -field="$3" "oh/hubs/$2/meta" 2>/dev/null
+}
+
+cmd_list() {
+  local tok hubs
+  tok=$(_token_all)
+  hubs=$(BAO_TOKEN="$tok" bao kv list -format=json oh/hubs 2>/dev/null | jq -r '.[]' | tr -d /)
+  [ -n "$hubs" ] || die "no hubs found"
+  for h in $hubs; do
+    printf '\n%s  (%s)\n' "$h" "$(_hub_field "$tok" "$h" exchange_url)"
+    local orgs; orgs=$(BAO_TOKEN="$tok" bao kv list -format=json "oh/hubs/$h/users" 2>/dev/null | jq -r '.[]' | tr -d /)
+    [ -z "$orgs" ] && { echo "    (no credentials stored)"; continue; }
+    for o in $orgs; do
+      for u in $(BAO_TOKEN="$tok" bao kv list -format=json "oh/hubs/$h/users/$o" 2>/dev/null | jq -r '.[]'); do
+        local md role ver
+        md=$(BAO_TOKEN="$tok" bao kv metadata get -format=json "oh/hubs/$h/users/$o/$u" 2>/dev/null)
+        role=$(printf '%s' "$md" | jq -r '.data.custom_metadata.role // "-"')
+        ver=$(printf '%s' "$md" | jq -r '.data.custom_metadata.verified_at // "never"')
+        printf '    %-22s role=%-10s verified=%s\n' "$o/$u" "$role" "$ver"
+      done
+    done
+  done
+}
+
+# Fetch credential + endpoints into caller-scoped vars. Never echoes them.
+_load() {  # _load <hub> <org> <user>
+  local hub="$1" org="$2" user="$3" tok path json
+  tok=$(_token_for "$hub")
+  path="oh/hubs/$hub/users/$org/$user"
+  json=$(BAO_TOKEN="$tok" bao kv get -format=json "$path" 2>/dev/null) \
+    || die "cannot read $path"
+  [ -n "$json" ] || die "no such credential: $path"
+  OH_USER=$(printf '%s' "$json" | jq -r '.data.data.username')
+  OH_PW=$(printf '%s' "$json"   | jq -r '.data.data.password')
+  OH_EXCHANGE=$(_hub_field "$tok" "$hub" exchange_url)
+  OH_CSS=$(_hub_field "$tok" "$hub" css_url)
+  OH_ROLE=$(BAO_TOKEN="$tok" bao kv metadata get -format=json "$path" 2>/dev/null \
+            | jq -r '.data.custom_metadata.role // "-"')
+  [ -n "$OH_PW" ] && [ "$OH_PW" != "null" ] || die "credential at $path has no password"
+}
+
+cmd_run() {
+  [ $# -ge 4 ] || die "usage: oh-cred run <hub> <org> <user> -- <cmd...>"
+  local hub="$1" org="$2" user="$3"; shift 3
+  [ "${1:-}" = "--" ] || die "expected -- before the command"
+  shift
+  [ $# -ge 1 ] || die "no command given"
+  _load "$hub" "$org" "$user"
+  # The secret exists only in this child process's environment.
+  HZN_ORG_ID="$org" \
+  HZN_EXCHANGE_USER_AUTH="$OH_USER:$OH_PW" \
+  HZN_EXCHANGE_URL="$OH_EXCHANGE" \
+  HZN_FSS_CSSURL="$OH_CSS" \
+  exec "$@"
+}
+
+# Authenticate against the hub the credential itself records. 401 means a bad
+# password; 403 means the password is good but the account lacks rights, which
+# still proves the credential is live.
+cmd_verify() {
+  [ $# -eq 3 ] || die "usage: oh-cred verify <hub> <org> <user>"
+  local hub="$1" org="$2" user="$3" url code
+  _load "$hub" "$org" "$user"
+  case "$OH_ROLE" in node) url="$OH_EXCHANGE/orgs/$org/nodes/$user" ;;
+                    *)    url="$OH_EXCHANGE/orgs/$org/users/$user" ;; esac
+  code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
+         -u "$org/$OH_USER:$OH_PW" "$url" 2>/dev/null || echo 000)
+  case "$code" in
+    200|403) printf '  %-10s %-20s %s  OK (HTTP %s)\n'     "$hub" "$org/$user" "$OH_ROLE" "$code"; return 0 ;;
+    401)     printf '  %-10s %-20s %s  REJECTED (401)\n'   "$hub" "$org/$user" "$OH_ROLE";        return 1 ;;
+    000)     printf '  %-10s %-20s %s  UNREACHABLE\n'      "$hub" "$org/$user" "$OH_ROLE";        return 2 ;;
+    *)       printf '  %-10s %-20s %s  HTTP %s\n'          "$hub" "$org/$user" "$OH_ROLE" "$code"; return 1 ;;
+  esac
+}
+
+cmd_verify_all() {
+  local rc=0 tok
+  tok=$(_token_all)
+  export BAO_TOKEN="$tok"
+  for h in $(bao kv list -format=json oh/hubs 2>/dev/null | jq -r '.[]' | tr -d /); do
+    for o in $(bao kv list -format=json "oh/hubs/$h/users" 2>/dev/null | jq -r '.[]' | tr -d /); do
+      for u in $(bao kv list -format=json "oh/hubs/$h/users/$o" 2>/dev/null | jq -r '.[]'); do
+        cmd_verify "$h" "$o" "$u" || rc=1
+      done
+    done
+  done
+  return $rc
+}
+
+case "${1:-}" in
+  list)       shift; cmd_list "$@" ;;
+  run)        shift; cmd_run "$@" ;;
+  verify)     shift; cmd_verify "$@" ;;
+  verify-all) shift; cmd_verify_all "$@" ;;
+  -h|--help|"") sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown subcommand '$1' (try: list, run, verify, verify-all)" ;;
+esac

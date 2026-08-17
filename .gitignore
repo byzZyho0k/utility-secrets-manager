@@ -1,0 +1,63 @@
+# This project exists because credentials ended up in places they should not.
+# Nothing secret should ever reach this repository. These rules are deliberately
+# broad and deny-by-default for anything credential-shaped — if a legitimate file
+# is caught, un-ignore that exact path rather than loosening a pattern.
+
+# Credential and environment files
+*.env
+!*.env.example
+*.envrc
+creds*
+*cred*.txt
+*secret*
+*password*
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+
+# Vault / seal material
+*init.json
+*keys.json
+*unseal*
+*.token
+*root-token*
+
+# Tokens and API keys
+pat.txt
+*.pat
+.netrc
+.npmrc
+*apikey*
+*api-key*
+
+# TLS
+*.crt
+*.csr
+!docs/**/*.example.crt
+
+# Vault CLI state
+.vault-token
+.bao-token
+
+# Audit logs — hashed, but still a record of who touched what
+audit.log
+*.audit
+
+# Editor and OS artifacts that quietly copy file contents
+._*
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+# Editors keep file *history*, which has leaked a credential copy before
+.cursor-server/
+**/History/
+
+# Local scratch
+tmp/
+scratch/
+*.bak
+*.orig
