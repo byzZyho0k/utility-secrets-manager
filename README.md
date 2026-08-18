@@ -65,7 +65,7 @@ Working and in production on one fleet. Not yet packaged, tested, or versioned �
 
 ## Roadmap
 
-- [ ] Test suite (the verification paths especially — they gate deletions)
+- [x] Test suite (the verification paths especially — they gate deletions)
 - [ ] `oh-cred rotate` — generate, set upstream, store, verify, in one step
 - [ ] Structured output (`--json`) for scripted consumers
 - [ ] Vault-agnostic backend so HashiCorp Vault works unmodified
