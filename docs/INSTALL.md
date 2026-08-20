@@ -484,3 +484,66 @@ with no manual step.
 Follow the gated workflow in ARCHITECTURE.md — inventory, fingerprint, import,
 `verify-all`, and only then shred the plaintext. Do not skip the fingerprint
 step; it is what catches files that look like duplicates but are not.
+
+## 11. Moving to another vault
+
+To copy the credential tree to a second, independent OpenBao instance — new
+hardware, a split estate, a rebuilt vault — use `scripts/transfer.sh`. It needs
+an admin token on **both** instances, because there is no path by which
+`oh-cred` itself reads a secret into the open.
+
+```bash
+export SRC_ADDR=https://old:8200 SRC_TOKEN=... SRC_CACERT=/opt/openbao/tls/tls.crt
+export DST_ADDR=https://new:8200 DST_TOKEN=... DST_CACERT=/opt/openbao/tls/tls.crt
+
+DRY_RUN=1 bash scripts/transfer.sh     # list what would move
+bash scripts/transfer.sh               # every hub
+bash scripts/transfer.sh unh-iol       # or just one
+```
+
+Values travel from the source read to the destination write over a pipe; nothing
+is printed or written to disk. Set `SKIP_EXISTING=1` to leave destination paths
+that already hold a secret.
+
+Three things the script handles that a hand-rolled loop tends to miss:
+
+- **`custom_metadata` is a separate KV v2 API path** and `kv put` does not carry
+  it. Lose it and every credential lands with `role=-` and no `exchange_url` —
+  which breaks `verify` (it chooses the node vs. user endpoint from `role`) and
+  destroys the self-verifying property described in ARCHITECTURE.md.
+- **`oh/hubs/<hub>/meta` and `/infra` are secrets too.** Users without hub
+  metadata gives you a destination where `run` exports an empty
+  `HZN_EXCHANGE_URL`.
+- **Soft-deleted secrets still appear in `kv list`** — metadata outlives data.
+  Copied blindly they arrive as `null` and look like real credentials. The script
+  skips them by name.
+
+The transfer moves secrets only. Policies, AppRoles, the audit device and the
+`oh/` mount itself are not copied — stand those up on the destination with steps
+3–7 first, and issue **new** `role_id`/`secret_id` pairs rather than copying
+`approle/*.env` across. One role per consumer is what makes revocation and audit
+meaningful.
+
+Then, against the destination:
+
+```bash
+oh-cred list
+oh-cred verify-all
+```
+
+Do not decommission the source until `verify-all` passes. A credential checked
+against the wrong hub returns `401` identically to an expired one — the failure
+mode in RATIONALE §1.
+
+### Or: the whole vault
+
+If the destination is meant to *be* the same vault on new hardware, a Raft
+snapshot is simpler and brings policies, roles and audit config with it:
+
+```bash
+bao operator raft snapshot save  fleet.snap
+bao operator raft snapshot restore fleet.snap
+```
+
+That produces a replica, not an independent instance: the unseal keys and root
+token come too. Use `transfer.sh` when the two vaults are meant to stay separate.
