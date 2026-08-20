@@ -1,4 +1,4 @@
 .PHONY: test
 
 test:
-	bats test/oh-cred.bats
+	bats test/*.bats

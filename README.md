@@ -55,7 +55,7 @@ The full account is in [docs/RATIONALE.md](docs/RATIONALE.md).
 |---|---|
 | [docs/RATIONALE.md](docs/RATIONALE.md) | The failure modes this exists to prevent, with the incidents behind them |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Path schema, auth model, design decisions and their tradeoffs |
-| [docs/INSTALL.md](docs/INSTALL.md) | Standing up the vault and the tool from scratch |
+| [docs/INSTALL.md](docs/INSTALL.md) | Standing up the vault and the tool from scratch, and moving it to another vault |
 | [docs/USAGE.md](docs/USAGE.md) | Day-to-day use, and how to grant an AI agent scoped access |
 
 ## Status
