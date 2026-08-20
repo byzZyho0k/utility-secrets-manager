@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # scripts/transfer.sh — copy the oh/ credential tree from one Bao to another.
 #
+# Requires bash 4+ (uses mapfile).  macOS ships bash 3.2; install bash via
+# Homebrew and invoke as: /opt/homebrew/bin/bash scripts/transfer.sh
+#
 # For moving a fleet's credentials to a second, independent OpenBao instance
 # (new hardware, a split estate, a rebuilt vault).  Requires an admin token on
 # BOTH instances: this is a vault-admin operation, not something oh-cred itself
@@ -9,6 +12,12 @@
 # Secret values pass through this process's memory and a pipe only.  Nothing is
 # printed, nothing is written to disk, nothing is passed as an argument.  Run it
 # on a host you already trust with both admin tokens.
+#
+# If the source vault is on loopback-only (recommended), open an SSH tunnel
+# first and point SRC_ADDR at the local end:
+#   ssh -f -N -L 18200:127.0.0.1:8200 user@source-host
+#   ssh user@source-host 'cat /opt/openbao/tls/tls.crt' > /tmp/src-ca.crt
+#   export SRC_ADDR=https://localhost:18200 SRC_CACERT=/tmp/src-ca.crt
 #
 # Usage:
 #   export SRC_ADDR=https://old:8200 SRC_TOKEN=... SRC_CACERT=/opt/openbao/tls/tls.crt

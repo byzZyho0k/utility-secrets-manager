@@ -430,6 +430,24 @@ bao token revoke -self     # with BAO_TOKEN set to the root token
 Recover later with `bao operator generate-root` and three unseal shares if ever
 needed. Delete any bootstrap helper script that embedded the root token.
 
+> **OpenBao ≥ 2.5.3:** `bao operator generate-root` and the `/sys/generate-root`
+> API endpoints are **disabled by default** (CVE-2026-5807). To recover, you must
+> temporarily add `disable_unauthed_generate_root_endpoints = false` to the
+> `listener` block in `openbao.hcl`, restart the vault, complete the
+> generate-root flow, then remove the line and restart again. Keep the window
+> as short as possible — the endpoint allows unauthenticated cancellation.
+> The new authenticated path (`/sys/generate-root-token`) requires an existing
+> valid token with `sudo` permission, which is unavailable when the root token
+> has been revoked; the unauthenticated path is the only recovery route.
+>
+> The `bao` CLI's `-generate-otp` flag also has a known bug in some 2.6 builds
+> where it makes a vault API call instead of running locally, and fails with 403.
+> Work around it with `LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 26`
+> to produce a 26-character OTP (check `otp_length` from
+> `GET /v1/sys/generate-root/attempt` — the required length may vary).
+> Drive the key submission steps with `curl` directly if the CLI routes to the
+> wrong path.
+
 ## 8. Install the client
 
 ```bash
@@ -499,6 +517,32 @@ export DST_ADDR=https://new:8200 DST_TOKEN=... DST_CACERT=/opt/openbao/tls/tls.c
 DRY_RUN=1 bash scripts/transfer.sh     # list what would move
 bash scripts/transfer.sh               # every hub
 bash scripts/transfer.sh unh-iol       # or just one
+```
+
+> **macOS:** the system `bash` is version 3.2 and does not support `mapfile`.
+> Install bash 4+ via Homebrew (`brew install bash`) and invoke the script with
+> the full path: `/opt/homebrew/bin/bash scripts/transfer.sh`.
+
+**If the source vault is bound to loopback** (the recommended config), it is not
+directly reachable from another host. Open an SSH tunnel before running the
+script, and point `SRC_ADDR` at the local end:
+
+```bash
+# Forward local port 18200 → 127.0.0.1:8200 on the source host
+ssh -f -N -L 18200:127.0.0.1:8200 user@source-host
+
+# Copy the source CA cert so TLS verification works through the tunnel
+ssh user@source-host 'cat /opt/openbao/tls/tls.crt' > /tmp/src-ca.crt
+
+export SRC_ADDR=https://localhost:18200
+export SRC_CACERT=/tmp/src-ca.crt
+# … set DST_ADDR, SRC_TOKEN, DST_TOKEN, DST_CACERT as normal …
+
+bash scripts/transfer.sh
+
+# Clean up
+rm /tmp/src-ca.crt
+pkill -f "ssh -f -N -L 18200"
 ```
 
 Values travel from the source read to the destination write over a pipe; nothing
