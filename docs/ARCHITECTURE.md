@@ -24,8 +24,42 @@ it touching anything durable in between.
 ```
 oh/hubs/<hub>/meta                  exchange_url, css_url, agbot_url, fdo_url, subnet
 oh/hubs/<hub>/users/<org>/<user>    username + password
-oh/hubs/<hub>/infra                 hub provisioning secrets (DB, agbot, FDO, vault keys)
+oh/hubs/<hub>/infra                 hub provisioning secrets (DB, agbot, FDO)
+
+oh/seal/<hub>                       that hub's OWN bao unseal shares + root token
+oh/wifi/<slug>                      wifi SSID + PSK
 ```
+
+### Why seal material is not under `oh/hubs/`
+
+Earlier revisions of this document listed "vault keys" as part of
+`oh/hubs/<hub>/infra`. That is not safe, and the reason is worth stating plainly:
+`llm-<hub>-ro` grants
+
+```hcl
+path "oh/data/hubs/<hub>/*" { capabilities = ["read"] }
+```
+
+— a **wildcard**. Anything placed beneath a hub is therefore readable by that
+hub's general-purpose read-only consumer. Storing unseal shares and a root token
+there would hand the fleet's most privileged secrets to every agent role that
+can already read an org password.
+
+Putting them in a sibling tree, `oh/seal/<hub>`, keeps them outside that wildcard
+**by construction**. The alternative — leaving them under the hub and adding an
+explicit `deny` — depends on the deny surviving every future policy edit. A path
+that was never in scope cannot be accidentally brought back into scope.
+
+The same reasoning puts wifi PSKs at `oh/wifi/<slug>`: a host or build process
+that legitimately needs a network credential should not sit one wildcard away
+from a vault root token.
+
+### Wifi entries are keyed by slug
+
+Real SSIDs contain spaces — `Pit of Despair`, `Cliffs of Insanity` — which make
+poor KV path components. Entries are addressed by a lowercase slug, and the true
+SSID is stored *in* the secret so `wifi-run` exports exactly what a supplicant
+expects. `wifi-list` shows the slug → SSID mapping.
 
 **Hub comes first, deliberately.** Org and user are not unique across a fleet —
 two independent hubs commonly both have `myorg/admin`. Hub-first makes the
@@ -64,7 +98,13 @@ external configuration to test it.
 | Human operator | userpass (or OIDC) | `human-admin` | full control of `oh/*` |
 | Agent, hub A | AppRole | `llm-<hubA>-ro` | read-only, hub A only |
 | Agent, hub B | AppRole | `llm-<hubB>-ro` | read-only, hub B only |
-| Health check | AppRole | `fleet-verifier` | read-only, all hubs |
+| Health check | AppRole | `fleet-verifier` | read-only, all hubs — **`oh/hubs/*` only** |
+| Unseal watchdog | AppRole | `oh-seal-operator` | read-only, `oh/seal/*` only |
+| Network consumer | AppRole | `oh-wifi-ro` | read-only, `oh/wifi/*` only |
+
+The policy files live in [`policies/`](../policies/). Note that `fleet-verifier`
+is anchored at `oh/data/hubs/*` rather than `oh/data/*` — a root wildcard would
+silently grant the health check every unseal key in the fleet.
 
 **One role per consumer.** Sharing a credential between tools makes revocation
 all-or-nothing and makes the audit log useless — you learn that *something* read
@@ -103,6 +143,35 @@ process's memory and dies with it.
 files, `ps`), not against a compromised host. A vault client cannot defend
 against root on the machine it runs on; nothing at this layer can.
 
+### Verification has a circuit breaker
+
+`verify` does not re-test a credential the exchange has already refused. A 401
+marks it `suspect`; later runs report it from stored state and issue no request.
+`--force` overrides, and a success clears the flag.
+
+**Why:** at least one hub in this fleet (`unh-iol`) firewalls an IP that produces
+too many 4xx responses. `verify-all` re-authenticating a stale credential on
+every run supplies exactly that, at whatever rate the health check runs. The
+resulting block then returns `000` for everything — **including the verification
+that would have told you the credential was stale.** The failure hides its own
+cause, and the instinct to re-check makes it worse.
+
+The rule is *stop the traffic, keep the alarm*: a suspect credential still counts
+as a fault everywhere it is reported, it just stops generating requests.
+
+An unreachable hub additionally gets a back-off window (`OH_CRED_BLOCK_COOLDOWN`,
+default 6h) during which its credentials are skipped entirely.
+
+**Where the state lives:** on the checking host
+(`$XDG_STATE_HOME/oh-cred/verify-state.json`), not in the vault. Two reasons —
+`oh-cred`'s AppRoles are deliberately read-only and cannot write, and "has *this*
+host recently been refused" is a property of the checker, not of the secret. A
+consumer with vault read access also cannot poison it.
+
+**Cost:** a credential fixed upstream keeps reporting as suspect until someone
+runs `verify --force` or `reset`. That is the intended trade — an automatic retry
+is the behaviour being prevented.
+
 ### Verification uses HTTP status, not a parsed error
 
 `verify` distinguishes:
@@ -113,6 +182,11 @@ against root on the machine it runs on; nothing at this layer can.
 | `403` | credential **valid**, account lacks rights for that endpoint |
 | `401` | credential rejected — the actual fault |
 | `000` | endpoint unreachable — a network problem, not a credential problem |
+
+Note `curl -w '%{http_code}'` prints `000` **and** exits non-zero when it cannot
+connect, so a `$(curl … || echo 000)` fallback concatenates into `000000` and
+never matches the `000` case. Take curl's own output and substitute only when it
+produced nothing at all.
 
 Treating `403` as success matters: a node credential legitimately cannot read
 admin endpoints, and reporting that as a credential failure would train people to

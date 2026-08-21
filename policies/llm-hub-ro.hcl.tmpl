@@ -1,0 +1,5 @@
+# llm-<hub>-ro — a per-hub agent's read-only role.
+# Scoped to ONE hub. Deliberately cannot reach oh/seal/* or oh/wifi/*.
+path "oh/data/hubs/<hub>/*"     { capabilities = ["read"] }
+path "oh/metadata/hubs/<hub>/*" { capabilities = ["read", "list"] }
+path "oh/metadata/hubs/<hub>"   { capabilities = ["list"] }

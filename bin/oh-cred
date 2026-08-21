@@ -8,11 +8,29 @@
 # Usage:
 #   oh-cred list                                  hubs and credentials (no secrets)
 #   oh-cred run <hub> <org> <user> -- <cmd...>    run cmd with HZN_* exported
-#   oh-cred verify <hub> <org> <user>             test the credential against its own hub
+#   oh-cred verify [--force] <hub> <org> <user>   test the credential against its own hub
 #   oh-cred verify-all                            verify every stored credential
+#   oh-cred state                                 show open circuit breakers
+#   oh-cred reset <hub> [<org> <user>]            clear breaker / back-off state
+#
+# A credential that is refused is marked suspect and is NOT re-tried on later
+# runs -- it stays reported as a fault, but stops generating traffic. Some hubs
+# (unh-iol) deny-list an IP after too many 4xx, which then masks the very state
+# you are trying to read. --force overrides once you have fixed something.
+#
+# Seal material (a hub's own OpenBao unseal keys / root token):
+#   oh-cred seal-list                             hubs with stored seal material
+#   oh-cred seal-status <hub>                     is that hub's bao sealed? (no secret)
+#   oh-cred unseal <hub>                          unseal it using the stored key
+#
+# Wifi pre-shared keys:
+#   oh-cred wifi-list                             stored networks (no secrets)
+#   oh-cred wifi-run <net> -- <cmd...>            run cmd with WIFI_SSID/WIFI_PSK
 #
 # Auth: uses $BAO_TOKEN when set (a human login), otherwise the per-hub
-# read-only AppRole in $APPROLE_DIR/llm-<hub>-ro.env.
+# read-only AppRole in $APPROLE_DIR/llm-<hub>-ro.env. Seal and wifi material sit
+# outside the oh/hubs/ tree and use their own roles (seal-operator, wifi-reader),
+# so the per-hub read-only role can never reach them.
 # Override defaults for macOS (Homebrew arm64):
 #   export BAO_CACERT=/opt/homebrew/etc/openbao/tls/tls.crt
 #   export OH_CRED_APPROLE_DIR=/opt/homebrew/etc/openbao/approle
@@ -49,6 +67,105 @@ _token_all() {
 
 _hub_field() {  # _hub_field <token> <hub> <field>
   BAO_TOKEN="$1" bao kv get -field="$3" "oh/hubs/$2/meta" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Verification state (circuit breaker)
+#
+# Deliberately local, not in Bao. oh-cred's AppRoles are read-only by design, so
+# it cannot write to the vault -- and it should not: whether *this* host has
+# recently been refused is a property of the checker, not of the secret. Keeping
+# it local also means a consumer with vault read access cannot poison it.
+#
+# Why a breaker exists at all: unh-iol firewalls IPs that produce too many 4xx
+# responses. One stale credential re-authenticated on every verify-all run
+# becomes an unbounded stream of 401s, which earns a deny-list entry -- after
+# which everything returns 000, including the check that would have told you the
+# credential was stale. Stop the traffic; keep the alarm.
+# ---------------------------------------------------------------------------
+
+STATE_DIR="${OH_CRED_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/oh-cred}"
+STATE_FILE="$STATE_DIR/verify-state.json"
+# How long to leave an unreachable hub alone before probing it again.
+BLOCK_COOLDOWN="${OH_CRED_BLOCK_COOLDOWN:-21600}"   # 6h
+
+_now_epoch() { date -u +%s; }
+_now_iso()   { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+_state_read() {
+  [ -r "$STATE_FILE" ] && cat "$STATE_FILE" 2>/dev/null || echo '{"creds":{},"hubs":{}}'
+}
+
+# Apply a jq filter to the state file, atomically.
+_state_apply() {  # _state_apply <jq-filter>
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local tmp; tmp=$(mktemp "$STATE_FILE.XXXXXX" 2>/dev/null) || return 0
+  if _state_read | jq -c "$1" > "$tmp" 2>/dev/null; then
+    mv -f "$tmp" "$STATE_FILE" 2>/dev/null || rm -f "$tmp"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+_cred_state() { # _cred_state <hub/org/user> <field>
+  _state_read | jq -r --arg k "$1" --arg f "$2" '.creds[$k][$f] // empty' 2>/dev/null
+}
+
+_hub_state() {  # _hub_state <hub> <field>
+  _state_read | jq -r --arg k "$1" --arg f "$2" '.hubs[$k][$f] // empty' 2>/dev/null
+}
+
+_mark_suspect() {  # _mark_suspect <key> <code>
+  _state_apply "$(printf '.creds[%s] = {status:"suspect", code:%s, since:%s, since_epoch:%s}' \
+    "$(printf '%s' "$1"           | jq -Rs .)" \
+    "$(printf '%s' "$2"           | jq -Rs .)" \
+    "$(printf '%s' "$(_now_iso)"  | jq -Rs .)" \
+    "$(_now_epoch)")"
+}
+
+_clear_suspect() { _state_apply "$(printf 'del(.creds[%s])' "$(printf '%s' "$1" | jq -Rs .)")"; }
+
+_mark_hub_blocked() {
+  _state_apply "$(printf '.hubs[%s] = {status:"unreachable", since:%s, since_epoch:%s}' \
+    "$(printf '%s' "$1"          | jq -Rs .)" \
+    "$(printf '%s' "$(_now_iso)" | jq -Rs .)" \
+    "$(_now_epoch)")"
+}
+
+_clear_hub_blocked() { _state_apply "$(printf 'del(.hubs[%s])' "$(printf '%s' "$1" | jq -Rs .)")"; }
+
+# Is this hub inside its back-off window?
+_hub_in_cooldown() {  # _hub_in_cooldown <hub>
+  local since; since=$(_hub_state "$1" since_epoch)
+  [ -n "$since" ] || return 1
+  [ $(( $(_now_epoch) - since )) -lt "$BLOCK_COOLDOWN" ]
+}
+
+cmd_state() {
+  printf '  state file: %s\n' "$STATE_FILE"
+  local st; st=$(_state_read)
+  printf '%s' "$st" | jq -r '
+    (.creds // {}) | to_entries[] |
+    "  SUSPECT  \(.key)  last=\(.value.code)  since \(.value.since)"' 2>/dev/null
+  printf '%s' "$st" | jq -r '
+    (.hubs // {}) | to_entries[] |
+    "  BLOCKED  \(.key)  since \(.value.since)"' 2>/dev/null
+  return 0
+}
+
+cmd_reset() {
+  [ $# -ge 1 ] || die "usage: oh-cred reset <hub> [<org> <user>]"
+  if [ $# -eq 1 ]; then
+    _clear_hub_blocked "$1"
+    _state_apply "$(printf '.creds |= with_entries(select(.key | startswith(%s) | not))' \
+      "$(printf '%s/' "$1" | jq -Rs .)")"
+    printf '  cleared state for hub %s\n' "$1"
+  elif [ $# -eq 3 ]; then
+    _clear_suspect "$1/$2/$3"
+    printf '  cleared suspect flag for %s/%s/%s\n' "$1" "$2" "$3"
+  else
+    die "usage: oh-cred reset <hub> [<org> <user>]"
+  fi
 }
 
 cmd_list() {
@@ -107,41 +224,245 @@ cmd_run() {
 # Authenticate against the hub the credential itself records. 401 means a bad
 # password; 403 means the password is good but the account lacks rights, which
 # still proves the credential is live.
+#
+# Exit codes: 0 ok · 1 credential fault · 2 hub unreachable · 3 skipped
+#
+# A credential that has already been refused is not re-tried: it is reported from
+# stored state instead. That keeps a known-bad credential loudly visible while
+# generating no further 4xx responses -- which is what gets an IP deny-listed in
+# the first place. `--force` overrides, for when you have actually fixed
+# something and want to re-test.
 cmd_verify() {
-  [ $# -eq 3 ] || die "usage: oh-cred verify <hub> <org> <user>"
-  local hub="$1" org="$2" user="$3" url code
+  local force=0
+  if [ "${1:-}" = "--force" ]; then force=1; shift; fi
+  [ $# -eq 3 ] || die "usage: oh-cred verify [--force] <hub> <org> <user>"
+  local hub="$1" org="$2" user="$3" url code key since
+  key="$hub/$org/$user"
+
+  if [ "$force" -eq 0 ]; then
+    # Hub-level back-off: do not probe a hub that recently dropped us.
+    if _hub_in_cooldown "$hub"; then
+      since=$(_hub_state "$hub" since)
+      printf '  %-10s %-20s %s  SKIPPED (hub unreachable since %s)\n' \
+        "$hub" "$org/$user" "-" "$since"
+      return 3
+    fi
+    # Credential-level breaker: already refused, do not ask again.
+    if [ "$(_cred_state "$key" status)" = "suspect" ]; then
+      since=$(_cred_state "$key" since)
+      printf '  %-10s %-20s %s  SUSPECT (HTTP %s since %s, not retried)\n' \
+        "$hub" "$org/$user" "-" "$(_cred_state "$key" code)" "$since"
+      return 1
+    fi
+  fi
+
   _load "$hub" "$org" "$user"
   case "$OH_ROLE" in node) url="$OH_EXCHANGE/orgs/$org/nodes/$user" ;;
                     *)    url="$OH_EXCHANGE/orgs/$org/users/$user" ;; esac
+
+  # curl prints "000" via -w AND exits non-zero when it cannot connect, so a
+  # `|| echo 000` fallback would concatenate into "000000" and miss the 000 case
+  # below. Take curl's own output and only substitute when it produced nothing.
   code=$(curl -sS -m 15 -o /dev/null -w '%{http_code}' \
-         -u "$org/$OH_USER:$OH_PW" "$url" 2>/dev/null || echo 000)
+         -u "$org/$OH_USER:$OH_PW" "$url" 2>/dev/null)
+  [ -n "$code" ] || code=000
+
   case "$code" in
-    200|403) printf '  %-10s %-20s %s  OK (HTTP %s)\n'     "$hub" "$org/$user" "$OH_ROLE" "$code"; return 0 ;;
-    401)     printf '  %-10s %-20s %s  REJECTED (401)\n'   "$hub" "$org/$user" "$OH_ROLE";        return 1 ;;
-    000)     printf '  %-10s %-20s %s  UNREACHABLE\n'      "$hub" "$org/$user" "$OH_ROLE";        return 2 ;;
-    *)       printf '  %-10s %-20s %s  HTTP %s\n'          "$hub" "$org/$user" "$OH_ROLE" "$code"; return 1 ;;
+    200|403)
+      _clear_suspect "$key"; _clear_hub_blocked "$hub"
+      printf '  %-10s %-20s %s  OK (HTTP %s)\n' "$hub" "$org/$user" "$OH_ROLE" "$code"; return 0 ;;
+    401)
+      _mark_suspect "$key" "$code"
+      printf '  %-10s %-20s %s  REJECTED (401, breaker open)\n' "$hub" "$org/$user" "$OH_ROLE"; return 1 ;;
+    000)
+      _mark_hub_blocked "$hub"
+      printf '  %-10s %-20s %s  UNREACHABLE (backing off %ss)\n' \
+        "$hub" "$org/$user" "$OH_ROLE" "$BLOCK_COOLDOWN"; return 2 ;;
+    *)
+      _mark_suspect "$key" "$code"
+      printf '  %-10s %-20s %s  HTTP %s (breaker open)\n' "$hub" "$org/$user" "$OH_ROLE" "$code"; return 1 ;;
   esac
 }
 
+# Aggregate: 1 if any credential is faulty (including ones held open by the
+# breaker), else 2 if a hub was unreachable, else 0. A fault outranks
+# unreachability -- a bad credential is our problem, a dropped connection may
+# not be.
 cmd_verify_all() {
-  local rc=0 tok
+  local fault=0 unreach=0 tok rc
   tok=$(_token_all) || exit $?
   export BAO_TOKEN="$tok"
   for h in $(bao kv list -format=json oh/hubs 2>/dev/null | jq -r '.[]' | tr -d /); do
     for o in $(bao kv list -format=json "oh/hubs/$h/users" 2>/dev/null | jq -r '.[]' | tr -d /); do
       for u in $(bao kv list -format=json "oh/hubs/$h/users/$o" 2>/dev/null | jq -r '.[]'); do
-        cmd_verify "$h" "$o" "$u" || rc=1
+        cmd_verify "$h" "$o" "$u"; rc=$?
+        case "$rc" in
+          1) fault=1 ;;
+          2) unreach=1 ;;
+          # Skipped behind a hub back-off still means that hub is unreachable.
+          # Folding it in keeps the exit code stable across runs: without this
+          # the first run reports 2 and every later one reports 0, so anything
+          # polling verify-all would read "all clear" while a hub stayed blocked.
+          3) unreach=1 ;;
+        esac
       done
     done
   done
-  return $rc
+  [ "$fault"   -eq 1 ] && return 1
+  [ "$unreach" -eq 1 ] && return 2
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Seal material — oh/seal/<hub>
+#
+# Deliberately NOT under oh/hubs/<hub>/, because llm-<hub>-ro grants
+# read on oh/data/hubs/<hub>/* by wildcard; parking unseal keys and root tokens
+# there would silently hand them to every per-hub read-only consumer. A separate
+# tree keeps them out of that blast radius by construction rather than by an
+# explicit deny somebody can delete later.
+# ---------------------------------------------------------------------------
+
+_token_role() {  # _token_role <role-file-basename> <description>
+  if [ -n "${BAO_TOKEN:-}" ]; then printf '%s' "$BAO_TOKEN"; return 0; fi
+  local f="$APPROLE_DIR/$1.env" rid sid
+  [ -r "$f" ] || die "no BAO_TOKEN set and cannot read $f ($2)"
+  rid=$(grep -m1 '^ROLE_ID=' "$f" | cut -d= -f2-)
+  sid=$(grep -m1 '^SECRET_ID=' "$f" | cut -d= -f2-)
+  bao write -field=token auth/approle/login role_id="$rid" secret_id="$sid" 2>/dev/null \
+    || die "AppRole login failed for $1"
+}
+
+# The hub's own bao endpoint. Non-secret, so it lives in custom metadata.
+_seal_addr() {  # _seal_addr <token> <hub>
+  BAO_TOKEN="$1" bao kv metadata get -format=json "oh/seal/$2" 2>/dev/null \
+    | jq -r '.data.custom_metadata.bao_addr // empty'
+}
+
+cmd_seal_list() {
+  local tok hubs
+  tok=$(_token_role seal-operator "seal material") || exit $?
+  hubs=$(BAO_TOKEN="$tok" bao kv list -format=json oh/seal 2>/dev/null | jq -r '.[]' | tr -d /)
+  [ -n "$hubs" ] || { echo "  (no seal material stored)"; return 0; }
+  for h in $hubs; do
+    local md addr st rot
+    md=$(BAO_TOKEN="$tok" bao kv metadata get -format=json "oh/seal/$h" 2>/dev/null)
+    addr=$(printf '%s' "$md" | jq -r '.data.custom_metadata.bao_addr // "-"')
+    st=$(printf  '%s' "$md" | jq -r '.data.custom_metadata.seal_type // "-"')
+    rot=$(printf '%s' "$md" | jq -r '.data.custom_metadata.rotated_at // "never"')
+    printf '  %-12s %-28s seal=%-8s rotated=%s\n' "$h" "$addr" "$st" "$rot"
+  done
+}
+
+cmd_seal_status() {
+  [ $# -eq 1 ] || die "usage: oh-cred seal-status <hub>"
+  local hub="$1" tok addr json
+  tok=$(_token_role seal-operator "seal material") || exit $?
+  addr=$(_seal_addr "$tok" "$hub")
+  [ -n "$addr" ] || die "no bao_addr recorded for hub '$hub' (is oh/seal/$hub populated?)"
+  json=$(curl -sS -m 15 "$addr/v1/sys/seal-status" 2>/dev/null) \
+    || die "cannot reach $addr"
+  [ -n "$json" ] || die "empty response from $addr"
+  printf '  %-12s %s  initialized=%s sealed=%s  (%s/%s shares)\n' \
+    "$hub" "$addr" \
+    "$(printf '%s' "$json" | jq -r '.initialized')" \
+    "$(printf '%s' "$json" | jq -r '.sealed')" \
+    "$(printf '%s' "$json" | jq -r '.progress')" \
+    "$(printf '%s' "$json" | jq -r '.t')"
+}
+
+# Submit stored key shares until the vault reports unsealed. The key is held in
+# a shell variable and POSTed via --data-binary @- on stdin, so it never becomes
+# an argv entry and never reaches the terminal.
+cmd_unseal() {
+  [ $# -eq 1 ] || die "usage: oh-cred unseal <hub>"
+  local hub="$1" tok addr json keys n i key code sealed
+  tok=$(_token_role seal-operator "seal material") || exit $?
+  addr=$(_seal_addr "$tok" "$hub")
+  [ -n "$addr" ] || die "no bao_addr recorded for hub '$hub'"
+
+  # Check the seal state before touching the secret: if the vault is already
+  # open there is no reason to read the unseal key at all, and every read of
+  # this particular secret is an audit event worth not generating.
+  sealed=$(curl -sS -m 15 "$addr/v1/sys/seal-status" 2>/dev/null | jq -r '.sealed')
+  if [ "$sealed" = "false" ]; then
+    printf '  %-12s already unsealed\n' "$hub"; return 0
+  fi
+
+  json=$(BAO_TOKEN="$tok" bao kv get -format=json "oh/seal/$hub" 2>/dev/null) \
+    || die "cannot read oh/seal/$hub"
+  keys=$(printf '%s' "$json" | jq -r '.data.data.unseal_keys_b64 // empty')
+  [ -n "$keys" ] && [ "$keys" != "null" ] \
+    || die "oh/seal/$hub has no unseal_keys_b64"
+
+  n=$(printf '%s' "$keys" | jq 'length')
+  for (( i=0; i<n; i++ )); do
+    key=$(printf '%s' "$keys" | jq -r ".[$i]")
+    code=$(printf '{"key":"%s"}' "$key" \
+      | curl -sS -m 15 -o /dev/null -w '%{http_code}' \
+             -X PUT --data-binary @- "$addr/v1/sys/unseal" 2>/dev/null || echo 000)
+    [ "$code" = "200" ] || { printf '  %-12s unseal rejected (HTTP %s)\n' "$hub" "$code"; return 1; }
+    sealed=$(curl -sS -m 15 "$addr/v1/sys/seal-status" 2>/dev/null | jq -r '.sealed')
+    [ "$sealed" = "false" ] && break
+  done
+
+  if [ "$sealed" = "false" ]; then
+    printf '  %-12s UNSEALED\n' "$hub"; return 0
+  fi
+  printf '  %-12s still sealed after %s share(s)\n' "$hub" "$n"; return 1
+}
+
+# ---------------------------------------------------------------------------
+# Wifi PSKs — oh/wifi/<slug>
+#
+# Keyed by slug, not by SSID: real SSIDs contain spaces ("Pit of Despair"), which
+# make miserable KV path components. The true SSID travels in the secret so
+# wifi-run exports exactly what the supplicant needs.
+# ---------------------------------------------------------------------------
+
+cmd_wifi_list() {
+  local tok nets
+  tok=$(_token_role wifi-reader "wifi PSKs") || exit $?
+  nets=$(BAO_TOKEN="$tok" bao kv list -format=json oh/wifi 2>/dev/null | jq -r '.[]' | tr -d /)
+  [ -n "$nets" ] || { echo "  (no wifi networks stored)"; return 0; }
+  for n in $nets; do
+    local md ssid hosts
+    md=$(BAO_TOKEN="$tok" bao kv metadata get -format=json "oh/wifi/$n" 2>/dev/null)
+    ssid=$(printf  '%s' "$md" | jq -r '.data.custom_metadata.ssid  // "-"')
+    hosts=$(printf '%s' "$md" | jq -r '.data.custom_metadata.hosts // "-"')
+    printf '  %-20s ssid=%-24s hosts=%s\n' "$n" "$ssid" "$hosts"
+  done
+}
+
+cmd_wifi_run() {
+  [ $# -ge 3 ] || die "usage: oh-cred wifi-run <net> -- <cmd...>"
+  local net="$1"; shift
+  [ "${1:-}" = "--" ] || die "expected -- before the command"
+  shift
+  [ $# -ge 1 ] || die "no command given"
+  local tok json ssid psk
+  tok=$(_token_role wifi-reader "wifi PSKs") || exit $?
+  json=$(BAO_TOKEN="$tok" bao kv get -format=json "oh/wifi/$net" 2>/dev/null) \
+    || die "cannot read oh/wifi/$net"
+  ssid=$(printf '%s' "$json" | jq -r '.data.data.ssid // empty')
+  psk=$(printf  '%s' "$json" | jq -r '.data.data.psk  // empty')
+  [ -n "$psk" ] && [ "$psk" != "null" ] || die "oh/wifi/$net has no psk"
+  [ -n "$ssid" ] || ssid="$net"
+  WIFI_SSID="$ssid" WIFI_PSK="$psk" exec "$@"
 }
 
 case "${1:-}" in
-  list)       shift; cmd_list "$@" ;;
-  run)        shift; cmd_run "$@" ;;
-  verify)     shift; cmd_verify "$@" ;;
-  verify-all) shift; cmd_verify_all "$@" ;;
-  -h|--help|"") sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown subcommand '$1' (try: list, run, verify, verify-all)" ;;
+  list)        shift; cmd_list "$@" ;;
+  run)         shift; cmd_run "$@" ;;
+  verify)      shift; cmd_verify "$@" ;;
+  state)       shift; cmd_state "$@" ;;
+  reset)       shift; cmd_reset "$@" ;;
+  verify-all)  shift; cmd_verify_all "$@" ;;
+  seal-list)   shift; cmd_seal_list "$@" ;;
+  seal-status) shift; cmd_seal_status "$@" ;;
+  unseal)      shift; cmd_unseal "$@" ;;
+  wifi-list)   shift; cmd_wifi_list "$@" ;;
+  wifi-run)    shift; cmd_wifi_run "$@" ;;
+  -h|--help|"") awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0" ;;
+  *) die "unknown subcommand '$1' (try: list, run, verify, verify-all, state, reset, seal-list, seal-status, unseal, wifi-list, wifi-run)" ;;
 esac

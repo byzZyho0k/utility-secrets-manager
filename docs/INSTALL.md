@@ -383,6 +383,33 @@ path "oh/metadata/hubs/<hub>"   { capabilities = ["list"] }
 Plus `fleet-verifier` (read-only across all hubs, for the health check) and
 `human-admin` (full control of `oh/*`).
 
+All policy files are committed in [`policies/`](../policies/) — they used to be
+described here in prose only, which made `fleet-verifier`'s real scope
+unreviewable. Two additional roles cover the non-hub trees:
+
+| Policy | Grants | Used by |
+|---|---|---|
+| `oh-seal-operator` | read `oh/seal/*` | `oh-cred unseal`, the unseal watchdog |
+| `oh-wifi-ro` | read `oh/wifi/*` | `oh-cred wifi-run` |
+
+```bash
+bao policy write oh-seal-operator policies/oh-seal-operator.hcl
+bao policy write oh-wifi-ro       policies/oh-wifi-ro.hcl
+
+bao write auth/approle/role/seal-operator \
+  token_policies="oh-seal-operator" token_ttl=1h token_max_ttl=4h
+bao write auth/approle/role/wifi-reader \
+  token_policies="oh-wifi-ro" token_ttl=1h token_max_ttl=4h
+```
+
+`oh-cred` looks for these at `$OH_CRED_APPROLE_DIR/seal-operator.env` and
+`$OH_CRED_APPROLE_DIR/wifi-reader.env`, in the same `ROLE_ID=`/`SECRET_ID=`
+format as the per-hub roles.
+
+> **Do not fold these into `fleet-verifier` or an `llm-<hub>-ro` role.** The
+> separation is the security property — see ARCHITECTURE.md, "Why seal material
+> is not under `oh/hubs/`".
+
 ```bash
 bao policy write llm-<hub>-ro   llm-<hub>-ro.hcl
 bao policy write fleet-verifier fleet-verifier.hcl
