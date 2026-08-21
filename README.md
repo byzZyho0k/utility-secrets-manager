@@ -31,11 +31,28 @@ design decision traces to something that actually went wrong:
 |---|---|
 | Six files all said `myorg/admin`; none said which hub. Copies on the wrong host returned `401` and were misdiagnosed as expired — then deleted. | Paths are **hub-first**. A credential cannot be separated from its exchange. |
 | A password rotated; nothing noticed for three months, until a `401` that looked like an unrelated problem. | `verify-all` authenticates every credential against the exchange it records, wired into the fleet health check. |
+| A stale credential re-verified on every health-check run tripped a hub's 4xx deny list. Everything then returned `000` — including the check that would have revealed the stale credential. | A refused credential is marked `suspect` and not re-tried; unreachable hubs get a back-off window. The alarm stays, the traffic stops. |
 | A redaction regex missed, and a live credential printed into an AI agent's transcript. | There is **no mode that prints a secret**. Injection is the only path. |
 | With no documented way to get a credential, tooling improvised — reading `*.env`, `/etc/environment`, `docker inspect`. | One documented command. Agents are told to use it and to stop rather than improvise. |
 | Files that looked like redundant copies held unique, live secrets and were nearly deleted. | Import-then-verify workflow; deletion only after retrieval is proven. |
 
 The full account is in [docs/RATIONALE.md](docs/RATIONALE.md).
+
+## What it holds
+
+Three kinds of secret, in three separate trees:
+
+| Tree | Holds | Commands |
+|---|---|---|
+| `oh/hubs/<hub>/…` | exchange credentials (org users, nodes) | `list`, `run`, `verify`, `verify-all` |
+| `oh/seal/<hub>` | a hub's **own** OpenBao unseal shares + root token | `seal-list`, `seal-status`, `unseal` |
+| `oh/wifi/<slug>` | wifi SSID + PSK | `wifi-list`, `wifi-run` |
+
+They are separate trees rather than one, because the per-hub read-only role is a
+wildcard (`oh/data/hubs/<hub>/*`). Anything filed under a hub is reachable by
+every consumer that can already read that hub's passwords — which is fine for an
+org password and emphatically not fine for a vault root token. See
+[ARCHITECTURE](docs/ARCHITECTURE.md#why-seal-material-is-not-under-ohhubs).
 
 ## What it is not
 
@@ -66,6 +83,12 @@ Working and in production on one fleet. Not yet packaged, tested, or versioned �
 ## Roadmap
 
 - [x] Test suite (the verification paths especially — they gate deletions)
+- [x] Seal material (`oh/seal/<hub>`) and wifi PSKs (`oh/wifi/<slug>`)
+- [x] Circuit breaker on repeated 4xx (a hub that deny-lists on 4xx turns a stale
+      credential into a self-concealing outage)
+- [ ] Teach the Pi image builder to pull its PSK via `wifi-run` at burn time
+      (deliberately deferred — the PSK is still plaintext in
+      `utility-raspberry-pi-image-builder/network.yaml`)
 - [ ] `oh-cred rotate` — generate, set upstream, store, verify, in one step
 - [ ] Structured output (`--json`) for scripted consumers
 - [ ] Vault-agnostic backend so HashiCorp Vault works unmodified

@@ -1,13 +1,30 @@
 # Usage
 
-## The four commands
+## The commands
+
+Exchange credentials — the original four:
 
 ```bash
 oh-cred list                                   # inventory — never shows secrets
 oh-cred run <hub> <org> <user> -- <command>    # run command with HZN_* set
-oh-cred verify <hub> <org> <user>              # test one credential against its own hub
+oh-cred verify [--force] <hub> <org> <user>    # test one credential against its own hub
 oh-cred verify-all                             # test every stored credential
+oh-cred state                                  # open circuit breakers / back-offs
+oh-cred reset <hub> [<org> <user>]             # clear breaker state
 ```
+
+Seal material and wifi PSKs, which live outside the `oh/hubs/` tree and use their
+own roles ([Seal material](#seal-material), [Wifi PSKs](#wifi-psks)):
+
+```bash
+oh-cred seal-list                              # hubs with stored seal material
+oh-cred seal-status <hub>                      # is that hub's bao sealed?
+oh-cred unseal <hub>                           # unseal it using the stored shares
+oh-cred wifi-list                              # stored networks, slug → SSID
+oh-cred wifi-run <slug> -- <command>           # run command with WIFI_SSID/WIFI_PSK
+```
+
+No command in either group prints a secret.
 
 ## Running commands
 
@@ -116,6 +133,75 @@ or shell configs. If `oh-cred` cannot supply what you need, say so and stop.
 That last instruction matters more than it looks. An agent with no sanctioned
 path will invent one, and its improvisation optimises for *finding* the secret,
 not for protecting it. See RATIONALE §4.
+
+## When a credential fails
+
+A refused credential is marked `suspect` and is **not** re-tested on later runs:
+
+```
+  unh   examples/joewxboy   -   SUSPECT (HTTP 401 since 2026-08-21T10:00:00Z, not retried)
+```
+
+It still counts as a fault wherever it is reported — it just stops generating
+traffic. This matters because `unh-iol` deny-lists an IP after too many 4xx, and
+a stale credential re-checked on every run is what earns the block. Once blocked
+everything returns `000`, including the check that would have told you the
+credential was stale.
+
+```bash
+oh-cred state                              # what breakers are open
+oh-cred verify --force unh examples joewxboy   # re-test after fixing something
+oh-cred reset unh examples joewxboy        # clear one credential's flag
+oh-cred reset unh                          # clear a hub's flag and back-off
+```
+
+A hub that returns `000` is put in a back-off window — 6h by default, set
+`OH_CRED_BLOCK_COOLDOWN` (seconds) to change it — during which its credentials
+are skipped without a request.
+
+**Do not "just check again" against a hub that is blocking you.** Repeated
+probing is the cause, not the diagnostic.
+
+## Seal material
+
+A hub's own OpenBao seals on every restart (Shamir, file storage, no native
+auto-unseal). Storing the shares here means a reboot is survivable and the key
+is not sitting in `/tmp` on the host it protects.
+
+```bash
+oh-cred seal-list                # hubs with stored seal material (no secrets)
+oh-cred seal-status edge1        # is that hub's bao sealed right now?
+oh-cred unseal edge1             # unseal it using the stored shares
+```
+
+`unseal` checks the seal state *before* reading the key, so an already-open vault
+costs no secret read and generates no audit entry for one. The share is POSTed on
+stdin, never as an argument, and is never printed.
+
+Storing material (human only — the AppRoles are read-only and cannot write):
+
+```bash
+bao login -method=userpass username=admin
+bash scripts/import-seal.sh edge1 http://192.168.50.85:8200 /tmp/edge1-keys.json
+shred -u /tmp/edge1-keys.json
+```
+
+## Wifi PSKs
+
+```bash
+oh-cred wifi-list                                   # slug → SSID, no secrets
+oh-cred wifi-run pit-of-despair -- some-command     # WIFI_SSID / WIFI_PSK exported
+```
+
+Entries are keyed by a lowercase slug because real SSIDs contain spaces; the true
+SSID rides in the secret, so the child process gets the exact string a supplicant
+needs.
+
+```bash
+bao login -method=userpass username=admin
+bash scripts/import-wifi.sh pit-of-despair 'Pit of Despair' 'rpi-*,edge1,edge2'
+# prompts for the PSK; never takes it as an argument
+```
 
 ## Anti-patterns
 
