@@ -44,10 +44,16 @@ die() { echo "oh-cred: $*" >&2; exit 1; }
 command -v bao >/dev/null || die "bao not installed"
 
 # Emit a token for the given hub, without echoing the secret_id.
+# If BAO_TOKEN is set, validate it first; fall through to the AppRole if it
+# is expired or lacks the necessary permissions.
 _token_for() {  # _token_for <hub>
-  if [ -n "${BAO_TOKEN:-}" ]; then printf '%s' "$BAO_TOKEN"; return 0; fi
+  if [ -n "${BAO_TOKEN:-}" ]; then
+    if bao token lookup >/dev/null 2>&1; then
+      printf '%s' "$BAO_TOKEN"; return 0
+    fi
+  fi
   local f="$APPROLE_DIR/llm-$1-ro.env"
-  [ -r "$f" ] || die "no BAO_TOKEN set and cannot read $f (is this hub configured?)"
+  [ -r "$f" ] || die "no valid BAO_TOKEN and cannot read $f (is this hub configured?)"
   local rid sid
   rid=$(grep -m1 '^ROLE_ID=' "$f" | cut -d= -f2-)
   sid=$(grep -m1 '^SECRET_ID=' "$f" | cut -d= -f2-)
@@ -56,9 +62,13 @@ _token_for() {  # _token_for <hub>
 }
 
 _token_all() {
-  if [ -n "${BAO_TOKEN:-}" ]; then printf '%s' "$BAO_TOKEN"; return 0; fi
+  if [ -n "${BAO_TOKEN:-}" ]; then
+    if bao token lookup >/dev/null 2>&1; then
+      printf '%s' "$BAO_TOKEN"; return 0
+    fi
+  fi
   local f="$APPROLE_DIR/fleet-verifier.env" rid sid
-  [ -r "$f" ] || die "no BAO_TOKEN and cannot read $f"
+  [ -r "$f" ] || die "no valid BAO_TOKEN and cannot read $f"
   rid=$(grep -m1 '^ROLE_ID=' "$f" | cut -d= -f2-)
   sid=$(grep -m1 '^SECRET_ID=' "$f" | cut -d= -f2-)
   bao write -field=token auth/approle/login role_id="$rid" secret_id="$sid" 2>/dev/null \
