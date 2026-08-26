@@ -1,5 +1,8 @@
 # oh-cred
 
+![License](https://img.shields.io/github/license/open-horizon-services/utility-credential-wrapper)
+![Contributors](https://img.shields.io/github/contributors/open-horizon-services/utility-credential-wrapper)
+
 A credential broker for Open Horizon fleets, built so that **people and AI coding
 agents can use secrets without ever seeing them.**
 
@@ -94,3 +97,118 @@ Working and in production on one fleet. Not yet packaged, tested, or versioned â
 - [ ] Vault-agnostic backend so HashiCorp Vault works unmodified
 - [ ] Package (`.deb`) and a systemd timer for scheduled `verify-all`
 - [ ] Generalise beyond `HZN_*` to arbitrary variable mappings
+
+## Prerequisites and setup
+
+**Management Hub:** [Install the Open Horizon Management Hub](https://open-horizon.github.io/quick-start) or have access to an existing hub. `oh-cred` uses the hub's exchange API for the `verify` and `verify-all` commands. You may also use a downstream commercial distribution such as IBM's Edge Application Manager.
+
+**Edge Node or workstation:** You will need a machine running Linux or macOS with [OpenBao](https://openbao.org) (or HashiCorp Vault) reachable from the host. The `oh-cred` script requires `bash`, `curl`, and the `bao` (or `vault`) CLI.
+
+**Optional utilities:** `jq` (for pretty-printing exchange responses), `hzn` (Open Horizon CLI, required for `verify` and `verify-all` subcommands), `bats` (for running the test suite).
+
+### Initial configuration
+
+Export your vault address and a token with read access to the `oh/` path:
+
+```shell
+export BAO_ADDR=https://vault.example.com:8200
+export BAO_TOKEN=<your-token>
+```
+
+If you use a per-hub read-only policy, you can scope the token to a single hub:
+
+```shell
+export HZN_ORG_ID=<your-org>
+```
+
+## Installation
+
+Clone the repository on the host where you want to run `oh-cred`:
+
+```shell
+git clone https://github.com/open-horizon-services/utility-credential-wrapper.git
+cd oh-cred
+```
+
+Copy (or symlink) the binary onto your `PATH`:
+
+```shell
+sudo cp bin/oh-cred /usr/local/bin/oh-cred
+# or
+sudo ln -s "$(pwd)/bin/oh-cred" /usr/local/bin/oh-cred
+```
+
+Confirm it is installed:
+
+```shell
+oh-cred --help
+```
+
+Run the test suite to confirm the installation is sound:
+
+```shell
+make test
+```
+
+## Usage
+
+Inject a credential into a child process (the secret is never printed):
+
+```shell
+oh-cred run hub-a myorg admin -- hzn exchange node list -o myorg
+```
+
+List all credentials stored for a hub:
+
+```shell
+oh-cred list hub-a
+```
+
+Verify every credential against its exchange:
+
+```shell
+oh-cred verify-all
+```
+
+Check the status of seal material for a hub:
+
+```shell
+oh-cred seal-status hub-a
+```
+
+Run a command with a wifi PSK injected:
+
+```shell
+oh-cred wifi-run home-network -- nmcli device wifi connect HomeSSID
+```
+
+See [docs/USAGE.md](docs/USAGE.md) for the full command reference and guidance on granting an AI agent scoped vault access.
+
+## Advanced details
+
+### Debugging
+
+`make test` runs the full BATS test suite and is the primary way to confirm correct behaviour.
+
+Check the vault path structure directly if a credential is not found:
+
+```shell
+bao kv list oh/hubs/<hub>/
+```
+
+Verify a single credential against its exchange:
+
+```shell
+oh-cred verify hub-a myorg admin
+```
+
+If `verify-all` is returning unexpected failures, check whether the hub is reachable and whether the credential has been marked `suspect` (circuit-breaker state). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details on the back-off behaviour.
+
+### All Makefile targets
+
+* `default` - run `test`
+* `test` - run the full BATS test suite (`bats test/*.bats`)
+* `install` - install `bin/oh-cred` to `$(DESTDIR)$(PREFIX)/bin` (default: `/usr/local/bin`)
+* `uninstall` - remove `oh-cred` from `$(DESTDIR)$(PREFIX)/bin`
+* `lint` - run `shellcheck` over `bin/oh-cred` and all scripts in `scripts/`
+* `clean` - remove generated artefacts (`tmp/`, `scratch/`, `coverage/`, `*.log`)
