@@ -61,3 +61,16 @@ tmp/
 scratch/
 *.bak
 *.orig
+
+# Windows OS artifact
+Thumbs.db
+
+# Vim swap alternate
+*.swo
+
+# Log directories and general log files
+logs/
+*.log
+
+# BATS test output artefacts
+test_helper/
