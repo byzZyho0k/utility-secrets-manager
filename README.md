@@ -1,7 +1,7 @@
 # oh-cred
 
-![License](https://img.shields.io/github/license/open-horizon-services/utility-credential-wrapper)
-![Contributors](https://img.shields.io/github/contributors/open-horizon-services/utility-credential-wrapper)
+![License](https://img.shields.io/github/license/open-horizon-services/utility-secrets-manager)
+![Contributors](https://img.shields.io/github/contributors/open-horizon-services/utility-secrets-manager)
 
 A credential broker for Open Horizon fleets, built so that **people and AI coding
 agents can use secrets without ever seeing them.**
@@ -126,8 +126,8 @@ export HZN_ORG_ID=<your-org>
 Clone the repository on the host where you want to run `oh-cred`:
 
 ```shell
-git clone https://github.com/open-horizon-services/utility-credential-wrapper.git
-cd oh-cred
+git clone https://github.com/open-horizon-services/utility-secrets-manager.git
+cd utility-secrets-manager
 ```
 
 Copy (or symlink) the binary onto your `PATH`:
