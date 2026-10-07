@@ -4,6 +4,7 @@
 Uso:
     python3 crear_video.py "TU FRASE AQUÍ" [salida.mp4] [--mood suspense|emocion]
     python3 crear_video.py --lote frases.txt      # un vídeo por línea
+    python3 crear_video.py "FRASE" --fondo clip.mp4   # usar tu propio vídeo de fondo
 """
 import argparse
 import os
@@ -13,6 +14,8 @@ import textwrap
 import wave
 
 import numpy as np
+
+import fondo_anime
 
 SR = 44100
 DUR = 15.0
@@ -44,6 +47,15 @@ def env(n, attack, release):
     return e
 
 
+def golpes():
+    beat_times, bt, gap = [], 0.5, 1.0
+    while bt < DUR - 0.6:
+        beat_times.append(bt)
+        bt += gap
+        gap = max(0.35, gap * 0.94)
+    return beat_times + [DUR - 0.9]
+
+
 def music(mood):
     n = int(DUR * SR)
     t = np.arange(n) / SR
@@ -66,12 +78,7 @@ def music(mood):
     out += 0.12 * np.sin(2 * np.pi * root * t) * np.clip(t / 2, 0, 1)
 
     # Latido / tambor épico que acelera y crece
-    beat_times, bt, gap = [], 0.5, 1.0
-    while bt < DUR - 0.6:
-        beat_times.append(bt)
-        bt += gap
-        gap = max(0.35, gap * 0.94)
-    for k, b in enumerate(beat_times):
+    for k, b in enumerate(golpes()):
         s = int(b * SR)
         ln = int(0.45 * SR)
         tt = np.arange(ln) / SR
@@ -123,42 +130,53 @@ def esc(s):
     return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "’").replace("%", "\\%")
 
 
-def render(frase, salida, mood):
+def render(frase, salida, mood, fondo=None, seed=0, gancho="ESCUCHA ESTO..."):
     lines = textwrap.wrap(frase.upper(), width=14)
     with tempfile.TemporaryDirectory() as tmp:
         wav = os.path.join(tmp, "m.wav")
         write_wav(wav, music(mood))
 
-        c0, c1 = ("0x0b0f1a", "0x3a0d12") if mood == "suspense" else ("0x0a1024", "0x5a2a00")
-        bg = (
-            f"gradients=s={W}x{H}:c0={c0}:c1={c1}:x0=0:y0=0:x1={W}:y1={H}:speed=0.015:d={DUR}:r=30"
-        )
-        # Partículas: ruido muy oscuro que sube, para dar textura
+        if fondo:
+            entrada = ["-stream_loop", "-1", "-i", fondo]
+            prep = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps=30,"
+                    f"eq=brightness=-0.12:saturation=1.15,")
+        else:
+            bg = os.path.join(tmp, "bg.mp4")
+            fondo_anime.generar(bg, mood, golpes(), DUR, seed)
+            entrada = ["-i", bg]
+            prep = ""
+
         draws = []
-        lh = 130
-        y0 = H / 2 - len(lines) * lh / 2
+        lh = 120
+        y0 = 560 - len(lines) * lh / 2
         for i, ln in enumerate(lines):
-            st = 1.2 + i * 0.9
-            alpha = f"if(lt(t,{st}),0,if(lt(t,{st + 0.6}),(t-{st})/0.6,1))"
+            st = 1.6 + i * 0.8
+            alpha = f"if(lt(t,{st}),0,if(lt(t,{st + 0.5}),(t-{st})/0.5,1))"
             draws.append(
                 f"drawtext=fontfile={FONT}:text='{esc(ln)}':fontsize=92:fontcolor=white:"
-                f"borderw=6:bordercolor=black@0.7:shadowx=0:shadowy=8:shadowcolor=black@0.6:"
-                f"x=(w-text_w)/2:y={y0 + i * lh}+20*(1-min(1\\,max(0\\,(t-{st})/0.6))):alpha='{alpha}'"
+                f"borderw=7:bordercolor=black@0.85:shadowx=0:shadowy=8:shadowcolor=black@0.7:"
+                f"x=(w-text_w)/2:y={y0 + i * lh}+25*(1-min(1\\,max(0\\,(t-{st})/0.5))):alpha='{alpha}'"
+            )
+        if gancho:
+            draws.insert(0,
+                f"drawtext=fontfile={FONT}:text='{esc(gancho)}':fontsize=64:fontcolor=0xFFD54A:"
+                f"borderw=6:bordercolor=black:x=(w-text_w)/2:y=170:enable='lt(t,1.6)'"
             )
         vf = (
-            f"[0:v]noise=alls=4:allf=t,"
-            f"zoompan=z='1+0.0006*on':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={W}x{H}:fps=30,"
-            f"vignette=PI/4,"
+            f"[0:v]{prep}"
+            f"zoompan=z='1+0.0005*on':x='iw/2-iw/zoom/2':y='ih/2-ih/zoom/2':d=1:s={W}x{H}:fps=30,"
+            f"vignette=PI/5,"
             + ",".join(draws)
-            + f",fade=t=in:st=0:d=0.8,fade=t=out:st={DUR - 0.6}:d=0.6[v]"
+            + f",fade=t=in:st=0:d=0.4,fade=t=out:st={DUR - 0.5}:d=0.5[v]"
         )
         cmd = [
             "ffmpeg", "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", bg,
+            *entrada,
             "-i", wav,
             "-filter_complex", vf,
             "-map", "[v]", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-maxrate", "8M", "-bufsize", "16M", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-maxrate", "10M", "-bufsize", "20M",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", "192k", "-t", str(DUR), "-movflags", "+faststart",
             salida,
         ]
@@ -172,14 +190,16 @@ def main():
     p.add_argument("salida", nargs="?", default="video.mp4")
     p.add_argument("--mood", choices=["suspense", "emocion"], default="emocion")
     p.add_argument("--lote", help="archivo con una frase por línea")
+    p.add_argument("--fondo", help="vídeo propio para usar de fondo (si no, se genera uno estilo anime)")
+    p.add_argument("--gancho", default="ESCUCHA ESTO...", help="texto gancho del primer segundo ('' para quitarlo)")
     a = p.parse_args()
     if a.lote:
         with open(a.lote, encoding="utf-8") as f:
             frases = [l.strip() for l in f if l.strip()]
         for i, fr in enumerate(frases, 1):
-            render(fr, f"video_{i:02d}.mp4", "suspense" if i % 2 else "emocion")
+            render(fr, f"video_{i:02d}.mp4", "suspense" if i % 2 else "emocion", a.fondo, i, a.gancho)
     elif a.frase:
-        render(a.frase, a.salida, a.mood)
+        render(a.frase, a.salida, a.mood, a.fondo, 0, a.gancho)
     else:
         p.error("pon una frase o --lote archivo.txt")
 
