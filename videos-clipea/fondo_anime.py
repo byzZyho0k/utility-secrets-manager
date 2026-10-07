@@ -136,7 +136,7 @@ def generar(salida, mood, golpes, dur, seed=0):
     p = PALETAS[mood]
     rng = np.random.default_rng(seed)
     sky = _cielo(p, rng)
-    sky += _luna(p, 540, 960, 250)
+    sky += _luna(p, 540, 1010, 240)
     stars_xy = rng.integers(0, [W, int(H * 0.5)], size=(260, 2))
     stars_ph = rng.uniform(0, 6.28, 260)
     lejos = _ciudad(p, rng, 1500, 200, 520, p["city2"], None, 400)
@@ -175,7 +175,7 @@ def generar(salida, mood, golpes, dur, seed=0):
         # golpe reciente -> relámpago / pulso de luz
         dt = t - golpes[golpes <= t].max() if (golpes <= t).any() else 9
         if mood == "suspense":
-            fl = max(0.0, 1 - dt / 0.18) * (0.55 if t > dur * 0.4 else 0.3)
+            fl = max(0.0, 1 - dt / 0.18) * (0.35 if t > dur * 0.4 else 0.2)
             if fl > 0:
                 fr = fr * (1 - fl) + np.array([200, 205, 255], np.float32) * fl
             # lluvia
